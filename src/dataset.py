@@ -47,7 +47,6 @@ class FinanciaMultilabel(pl.LightningModule):
             nn.ReLU(),
             nn.Dropout(p=0.2),
             nn.Linear(128, self.num_labels),
-            nn.Sigmoid()
         )
         self.loss = nn.BCELoss()
 
