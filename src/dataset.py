@@ -1,10 +1,15 @@
-from sklearn.metrics import confusion_matrix
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer, BertForSequenceClassification
+from transformers import ( 
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    modelForSequenceClassification,
+    get_constant_schedule_with_warmup,
+)
 
 import pytorch_lightning as pl
 from torchmetrics.functional import accuracy, f1
+from torchmetrics import Accuracy, F1, Precision, Recall
 import wandb
 
 
@@ -21,7 +26,6 @@ class FinanciaSentimental(Dataset):
     def __getitem__(self, index):
         """Get the data at the index"""
         values = self.dataframe.iloc[index]
-        label = values[type]
         text = values['text']
         inputs = self.tokenizer.encode_plus(
             text,
@@ -35,65 +39,69 @@ class FinanciaSentimental(Dataset):
         )
         return inputs['input_ids'].squeeze(0), inputs['attention_mask'].squeeze(0), label
     
+
+
 class FinanciaMultilabel(pl.LightningModule):
     """This class is used to create the model"""
-    def __init__(self, num_labels=3, model_name='roberta-base'):
+    def __init__(self, num_labels, model_name, class_weights):
         super().__init__()
         self.num_labels = num_labels
-        #TODO: change the model by model in spanish.
-        self.roberta = RobertaModel.from_pretrained(model_name)
-        self.classifier = nn.Sequential(
-            nn.Linear(self.roberta.config.hidden_size, 128),
-            nn.ReLU(),
-            nn.Dropout(p=0.2),
-            nn.Linear(128, self.num_labels),
-        )
-        self.loss = nn.BCELoss()
+        # The models is multi-label, so we need to use BCEWithLogitsLoss
+        self.loss = nn.BCEWithLogitsLoss(pos_weight=class_weights, reduction='none')
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=self.num_labels, ignore_mismatched_sizes=True)
+        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        #Metrics for the model for training
+        self.train_f1 = F1(task = "multilabel", num_classes=self.num_labels)
+        self.train_accuracy = Accuracy(task ="multilabel", num_classes=self.num_labels)
+        self.train_precision = Precision(task ="multilabel", num_classes=self.num_labels)
+        self.train_recall = Recall(task ="multilabel", num_classes=self.num_labels)
+        # Metrics for the model for validation
+        self.val_f1 = F1(task = "multilabel", num_classes=self.num_labels)
+        self.val_accuracy = Accuracy(task ="multilabel", num_classes=self.num_labels)
+        self.val_precision = Precision(task ="multilabel", num_classes=self.num_labels)
+        self.val_recall = Recall(task ="multilabel", num_classes=self.num_labels)
+        
+        self.save_hyperparameters()
 
     def forward(self, input_ids, attention_mask):
         """This function is used to forward the data through the model"""
-        output = self.roberta(input_ids, attention_mask=attention_mask)
-        output = output[0]
-        output = self.classifier(output)
-        return output
+        output = self.model(input_ids, attention_mask=attention_mask)
+        logits = output.logits
+        return logits
 
     def training_step(self, batch, batch_idx):
         """This function is used to train the model"""
         input_ids, attention_mask, labels = batch
-        outputs = self(input_ids, attention_mask)
-        train_loss = self.loss(outputs, labels)
-        train_acc = accuracy(outputs, labels)
-        train_f1 = f1(outputs, labels)
-        wandb.log({'train_loss': train_loss, 'train_acc': train_acc, 'train_f1': train_f1})
-        return {'loss': train_loss, 'train_acc': train_acc, 'train_f1': train_f1}
+        logits = self(input_ids, attention_mask)
+        train_loss = self.loss(logits, labels)
+        train_acc = self.train_accuracy(logits, labels)
+        train_f1 = self.train_f1(logits, labels)
+        train_score = self.train_precision(logits, labels)
+        train_recall = self.train_recall(logits, labels)
+        self.log("train/loss", loss, on_step=False, on_epoch=True)
+        self.log("train/accuracy", self.train_accuracy, on_step=False, on_epoch=True)
+        self.log("train/precision", self.train_precision, on_step=False, on_epoch=True)
+        self.log("train/recall", self.train_recall, on_step=False, on_epoch=True)
+        self.log("train/f1_score", self.train_f1_score, on_step=False, on_epoch=True)
+        return loss
 
     def validation_step(self, batch, batch_idx):
         """This function is used to validate the model"""
         input_ids, attention_mask, labels = batch
-        outputs = self(input_ids, attention_mask)
-        val_loss = self.loss(outputs, labels)
-        val_acc = accuracy(outputs, labels)
-        val_f1 = f1(outputs, labels)
-        wandb.log({'val_loss': val_loss, 'val_acc': val_acc, 'val_f1': val_f1})
-        return {'val_loss': val_loss, 'val_acc': val_acc, 'val_f1': val_f1}
-
-    def test_step(self, batch, batch_idx):
-        """This function is used to test the model"""
-        input_ids, attention_mask, labels = batch
-        outputs = self(input_ids, attention_mask)
-        test_loss = self.loss(outputs, labels)
-        test_acc = accuracy(outputs, labels)
-        test_f1 = f1(outputs, labels)
-        wandb.log({'test_loss': test_loss, 'test_acc': test_acc, 'test_f1': test_f1})
-        return {'test_loss': test_loss, 'test_acc': test_acc, 'test_f1': test_f1}
-
-    def test_epoch_end(self, outputs):
-        """This function is used to aggregate test results"""
-        avg_test_loss = torch.stack([x['test_loss'] for x in outputs]).mean()
-        avg_test_acc = torch.stack([x['test_acc'] for x in outputs]).mean()
-        avg_test_f1 = torch.stack([x['test_f1'] for x in outputs]).mean()
-        wandb.log({'avg_test_loss': avg_test_loss, 'avg_test_acc': avg_test_acc, 'avg_test_f1': avg_test_f1})
-        return {'avg_test_loss': avg_test_loss, 'avg_test_acc': avg_test_acc, 'avg_test_f1': avg_test_f1}
+        logits = self(input_ids, attention_mask)
+        val_loss = self.loss(logits, labels)
+        val_acc = self.val_accuracy(outputs, labels)
+        val_f1 = self.val_f1(outputs, labels)
+        val_recall = self.val_recall(outputs, labels)
+        val_precision = self.val_precision(outputs, labels)
+        
+        self.log("val/loss", val_loss, on_step=False, on_epoch=True)
+        self.log("val/accuracy", self.val_accuracy, on_step=False, on_epoch=True)
+        self.log("val/precision", self.val_precision, on_step=False, on_epoch=True)
+        self.log("val/recall", self.val_recall, on_step=False, on_epoch=True)
+        self.log("val/f1_score", self.val_f1_score, on_step=False, on_epoch=True)
+        self.log("val/loss", val_loss, on_step=False, on_epoch=True)
+        return val_loss
 
     def configure_optimizers(self):
         """This function is used to configure the optimizer"""
