@@ -18,7 +18,14 @@ class FinanciaSentimental(Dataset):
     def __init__(self, tokenizer, data, type):
         self.tokenizer = tokenizer
         self.dataframe = dataframe
-        
+        ## Columns to target
+        self._columns = ["target_sentiment", "companies_sentiment", "consumers_sentiment"]
+    
+    @property
+    def columns(self):
+        """Return the columns to target"""
+        return self._columns
+
     def __len__(self):
         """Return the length of the dataset"""
         return self.dataframe.count()
@@ -27,6 +34,7 @@ class FinanciaSentimental(Dataset):
         """Get the data at the index"""
         values = self.dataframe.iloc[index]
         text = values['text']
+        label = pd.get_dummies(values[self._columns], columns=[self._columns]).values.astype(np.int8)
         inputs = self.tokenizer.encode_plus(
             text,
             add_special_tokens=True,
@@ -37,6 +45,7 @@ class FinanciaSentimental(Dataset):
             return_attention_mask=True,
             return_tensors='pt'
         )
+        label = torch.tensor(label, dtype=torch.int8)
         return inputs['input_ids'].squeeze(0), inputs['attention_mask'].squeeze(0), label
     
 
